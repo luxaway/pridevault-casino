@@ -1,0 +1,6 @@
+[settings]
+main = "pridevault-casino"
+
+[contracts.pridevault-casino]
+name = "pridevault-casino"
+add-unlabelled = true
