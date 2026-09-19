@@ -1,0 +1,7 @@
+/target
+/output
+Cargo.lock
+.idea
+.vscode
+*.wasm
+*.wat
