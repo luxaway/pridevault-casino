@@ -102,10 +102,7 @@ pub trait PridevaultCasino {
             self.round_open().is_empty() || !self.round_open().get(),
             "already open"
         );
-        require!(
-            self.bets_to_settle().is_empty(),
-            "finish previous resolve"
-        );
+        require!(!self.has_unsettled_bets(), "finish previous resolve");
 
         let next_id = self.round_id().get() + 1;
         self.round_id().set(next_id);
@@ -113,6 +110,7 @@ pub trait PridevaultCasino {
         let end = self.blockchain().get_block_nonce() + self.round_blocks().get();
         self.round_end_block().set(end);
         self.round_liability().set(BigUint::zero());
+        self.round_seed().clear();
         self.bets().clear();
         self.round_started_event(next_id, end);
     }
@@ -122,7 +120,7 @@ pub trait PridevaultCasino {
     #[endpoint(placeBet)]
     fn place_bet(&self, under: u64) {
         self.require_not_paused();
-        require!(self.round_open().get(), "no open round");
+        require!(!self.round_open().is_empty() && self.round_open().get(), "no open round");
         require!(
             self.blockchain().get_block_nonce() < self.round_end_block().get(),
             "betting closed"
@@ -135,12 +133,11 @@ pub trait PridevaultCasino {
 
         let payout = self.potential_payout(&amount, under);
         let new_liability = self.round_liability().get() + &payout;
-        let balance = self.blockchain().get_sc_balance(
-            &EgldOrEsdtTokenIdentifier::egld(),
-            0,
-        );
+        let balance = self
+            .blockchain()
+            .get_sc_balance(&EgldOrEsdtTokenIdentifier::egld(), 0);
         require!(
-            balance >= &new_liability + &self.min_bankroll().get(),
+            balance >= &new_liability + &self.min_bankroll().get() + &self.total_claimable().get(),
             "insufficient bankroll"
         );
 
@@ -159,11 +156,13 @@ pub trait PridevaultCasino {
         self.bet_placed_event(self.round_id().get(), &player, &amount, under);
     }
 
-    /// Close betting and start settling. Can be called by anyone after deadline.
-    /// May need several calls if many bets (gas).
+    /// Close betting and settle. Callable by anyone after deadline.
+    /// Call again if there are more than 50 bets (gas).
     #[endpoint(resolveRound)]
     fn resolve_round(&self) {
-        require!(!self.round_open().is_empty() && self.round_open().get(), "no open round");
+        let open = !self.round_open().is_empty() && self.round_open().get();
+        let resolving = !self.round_seed().is_empty();
+        require!(open || resolving, "nothing to resolve");
         require!(
             self.blockchain().get_block_nonce() >= self.round_end_block().get(),
             "too early"
@@ -199,17 +198,15 @@ pub trait PridevaultCasino {
 
             if won {
                 let payout = self.potential_payout(&bet.amount, bet.under);
-                self.claimable(&bet.player)
-                    .update(|c| *c += payout);
+                self.claimable(&bet.player).update(|c| *c += &payout);
+                self.total_claimable().update(|t| *t += payout);
             }
             processed += 1;
         }
 
-        let all_done = self.all_bets_settled();
-        if all_done {
+        if self.all_bets_settled() {
             self.round_liability().clear();
             self.round_seed().clear();
-            self.bets_to_settle_flag_clear();
         }
     }
 
@@ -218,6 +215,7 @@ pub trait PridevaultCasino {
         let caller = self.blockchain().get_caller();
         let amount = self.claimable(&caller).take();
         require!(amount > 0, "nothing to claim");
+        self.total_claimable().update(|t| *t -= &amount);
         self.tx().to(&caller).egld(&amount).transfer();
         self.claim_event(&caller, &amount);
     }
@@ -229,10 +227,9 @@ pub trait PridevaultCasino {
         require!(self.round_open().is_empty() || !self.round_open().get(), "round open");
         require!(self.round_seed().is_empty(), "resolve in progress");
 
-        let balance = self.blockchain().get_sc_balance(
-            &EgldOrEsdtTokenIdentifier::egld(),
-            0,
-        );
+        let balance = self
+            .blockchain()
+            .get_sc_balance(&EgldOrEsdtTokenIdentifier::egld(), 0);
         let reserved = self.min_bankroll().get() + self.total_claimable().get();
         require!(balance > reserved, "nothing to skim");
         let surplus = balance - reserved;
@@ -242,15 +239,11 @@ pub trait PridevaultCasino {
     }
 
     fn potential_payout(&self, amount: &BigUint, under: u64) -> BigUint {
-        // payout = amount * 100 / under * (10000 - 400) / 10000
         amount * ROLL_MOD / under * (BPS_DENOM - HOUSE_EDGE_BPS) / BPS_DENOM
     }
 
     fn roll_for(&self, seed: u64, index: u64) -> u64 {
-        let mut rng = RandomnessSource::new();
-        // mix committed round seed + bet index; extra entropy from VM seed
-        let extra = rng.next_u64();
-        seed.wrapping_mul(1_000_003).wrapping_add(index).wrapping_add(extra) % ROLL_MOD
+        seed.wrapping_mul(1_000_003).wrapping_add(index) % ROLL_MOD
     }
 
     fn all_bets_settled(&self) -> bool {
@@ -263,15 +256,8 @@ pub trait PridevaultCasino {
         true
     }
 
-    fn bets_to_settle_flag_clear(&self) {
-        // placeholder for readability; state already reflected by settled flags
-    }
-
-    fn bets_to_settle(&self) -> bool {
-        if self.round_seed().is_empty() {
-            return false;
-        }
-        !self.all_bets_settled()
+    fn has_unsettled_bets(&self) -> bool {
+        !self.round_seed().is_empty() && !self.all_bets_settled()
     }
 
     fn require_not_paused(&self) {
