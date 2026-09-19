@@ -1,55 +1,36 @@
-# PrideVault Casino — ROAR Dice
-
-Jeu on-chain MultiversX pour financer **PrideVault**.
+# PrideVault Casino — ROAR Dice (self-sustaining)
 
 Repo: https://github.com/luxaway/pridevault-casino
 
-## Pourquoi ce jeu (et pas un flip 1-tx)
+Le jeu doit vivre sur **ses mises**, pas sur des recharges owner toutes les semaines.
 
-Sur MultiversX, un `roll` dans la même transaction que la mise est **tricheable** : le joueur simule la tx et ne l’envoie que s’il gagne.  
-La doc officielle l’interdit.  
-Ici : **rounds**. Les mises sont lockées *avant* le tirage. Le RNG ne tourne qu’à `resolveRound`, quand plus personne ne peut changer sa mise.
+## Modèle éco
 
-## Règles
+1. **Seed unique** — tu fonds le bankroll une fois (`fundBankroll`).
+2. **Rake 2%** sur chaque mise — revenu certain, resté dans le contrat jusqu’à ce que le buffer soit plein.
+3. **Edge 5%** sur les payouts — avantage maison long terme.
+4. **Mise max dynamique** = 2% du bankroll libre, plafonnée par `cap_max_bet`. Une win streak ne peut pas vider la caisse.
+5. **Pause auto** si le bankroll libre passe sous `min_bankroll`.
+6. **Skim** seulement au-dessus de **2× min_bankroll**, et seulement la moitié du surplus + rake. Le reste reste pour jouer.
 
-- Dés 0–99
-- Le joueur choisit `under` (2 à 96) : il gagne si `roll < under`
-- House edge **4%** (400 bps) → trésorerie PrideVault
-- Exemple : `under = 50` → chance 50% → payout ×1.92 (mise incluse)
-- Bankroll dans le contrat, mise max limitée par la liquidité
-- Gains en `claim` (pas de payout massif au resolve → moins de risque gas)
+Après le seed, PrideVault encaisse via `skimToTreasury` quand ça roule. Pas besoin de réinjecter — si ça pause, tu attends le volume ou tu réduis encore les mises (le cap dynamique le fait tout seul).
 
-## Revenu projet
+## Règles de jeu
 
-Sur le long terme, l’edge de 4% + les mises perdues restent dans le contrat.  
-`skimToTreasury` envoie le surplus au-dessus de `min_bankroll` vers l’adresse trésorerie.
+- Dés 0–99, `under` 2–96, win si `roll < under`
+- Payout sur le **net** (mise − rake 2%), avec edge 5%
+- Ex. 1 EGLD @ under 50 → net 0.98 → payout win ≈ 1.86
 
-Ce n’est **pas** un revenu garanti court terme : une série de wins peut arriver. Dimensionne le bankroll (recommandé : ≥ 30–50× la mise max).
+## Seed recommandé (devnet / petit lancement)
 
-## Légal
+| | Exemple |
+|---|---|
+| Seed bankroll | 10 EGLD |
+| min_bankroll | 5 EGLD |
+| min_bet | 0.05 EGLD |
+| cap_max_bet | 0.20 EGLD |
+| Mise max réelle au départ | min(0.20, 2% de ~10) = 0.20 cap |
 
-Jeu d’argent. À vérifier au Québec / Canada (Loto-Québec, lois provinciales) avant tout mainnet public. Ce repo = code + tests, pas une licence d’opérateur.
+Monte le cap seulement quand le bankroll a grossi.
 
-**Pas audité. Devnet d’abord.**
-
-## Build
-
-```bash
-git clone https://github.com/luxaway/pridevault-casino
-cd pridevault-casino
-cargo install multiversx-sc-meta --locked
-sc-meta all build
-```
-
-## Endpoints clés
-
-| Endpoint | Qui | Rôle |
-|---|---|---|
-| `init(treasury, min_bet, max_bet, round_blocks)` | deploy | setup |
-| `fundBankroll` | owner, payable EGLD | remplir la caisse |
-| `startRound` | owner / auto | ouvrir un round |
-| `placeBet(under)` | joueur, payable EGLD | miser |
-| `resolveRound` | n’importe qui après deadline | tirer le seed + scorer |
-| `claim` | gagnant | retirer |
-| `skimToTreasury` | owner | envoyer le profit |
-| `pause` / `unpause` | owner | stop urgence |
+**Pas audité. Devnet d’abord. Jeu d’argent : vérifier le cadre Québec/Canada avant un mainnet public.**
