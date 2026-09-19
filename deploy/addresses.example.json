@@ -1,0 +1,9 @@
+{
+  "network": "devnet",
+  "contract": "",
+  "owner": "",
+  "treasury": "",
+  "roarToken": "",
+  "deployTx": "",
+  "prideVaultField": "src/lib/sections.ts → GAMES.roarDice"
+}
