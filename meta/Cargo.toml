@@ -1,0 +1,9 @@
+[package]
+name = "pridevault-casino-meta"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+pridevault-casino = { path = ".." }
+multiversx-sc-meta-lib = "=0.66.2"
