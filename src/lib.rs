@@ -2,18 +2,17 @@
 
 use multiversx_sc::imports::*;
 
-/// Payout house edge 5.00%.
 const HOUSE_EDGE_BPS: u64 = 500;
-/// Instant rake 2.00% of each bet. Accrued in-contract; only skimmed when buffer is healthy.
-const RAKE_BPS: u64 = 200;
+/// ROAR keeps the current 2% rake.
+const RAKE_ROAR_BPS: u64 = 200;
+/// EGLD rake is higher than ROAR.
+const RAKE_EGLD_BPS: u64 = 400;
 const BPS_DENOM: u64 = 10_000;
 const MIN_UNDER: u64 = 2;
 const MAX_UNDER: u64 = 96;
 const ROLL_MOD: u64 = 100;
 const MAX_BETS_PER_RESOLVE: usize = 50;
-/// Max single bet = 2% of free bankroll.
 const MAX_BET_FREE_BPS: u64 = 200;
-/// Keep at least 2× min_bankroll before any treasury skim.
 const SKIM_BUFFER_MULT: u32 = 2;
 
 #[derive(TopEncode, TopDecode, NestedEncode, NestedDecode, TypeAbi, Clone)]
@@ -21,6 +20,7 @@ pub struct Bet<M: ManagedTypeApi> {
     pub player: ManagedAddress<M>,
     pub amount: BigUint<M>,
     pub under: u64,
+    pub is_roar: bool,
     pub settled: bool,
     pub won: bool,
     pub roll: u64,
@@ -32,22 +32,31 @@ pub trait PridevaultCasino {
     fn init(
         &self,
         treasury: ManagedAddress,
-        min_bet: BigUint,
-        cap_max_bet: BigUint,
+        roar_token: TokenIdentifier,
+        min_bet_egld: BigUint,
+        cap_max_egld: BigUint,
+        min_bet_roar: BigUint,
+        cap_max_roar: BigUint,
         round_blocks: u64,
-        min_bankroll: BigUint,
+        min_bankroll_egld: BigUint,
+        min_bankroll_roar: BigUint,
     ) {
         require!(!treasury.is_zero(), "treasury required");
-        require!(min_bet > 0, "min bet");
-        require!(cap_max_bet >= min_bet, "max < min");
+        require!(roar_token.is_valid_esdt_identifier(), "bad ROAR token");
+        require!(min_bet_egld > 0 && cap_max_egld >= min_bet_egld, "bad EGLD bets");
+        require!(min_bet_roar > 0 && cap_max_roar >= min_bet_roar, "bad ROAR bets");
         require!(round_blocks >= 2, "round too short");
-        require!(min_bankroll > 0, "min bankroll");
+        require!(min_bankroll_egld > 0 && min_bankroll_roar > 0, "min bankroll");
 
         self.treasury().set(treasury);
-        self.min_bet().set(min_bet);
-        self.cap_max_bet().set(cap_max_bet);
+        self.roar_token().set(roar_token);
+        self.min_bet_egld().set(min_bet_egld);
+        self.cap_max_egld().set(cap_max_egld);
+        self.min_bet_roar().set(min_bet_roar);
+        self.cap_max_roar().set(cap_max_roar);
         self.round_blocks().set(round_blocks);
-        self.min_bankroll().set(min_bankroll);
+        self.min_bankroll_egld().set(min_bankroll_egld);
+        self.min_bankroll_roar().set(min_bankroll_roar);
         self.is_paused().set(false);
         self.round_id().set(0u64);
     }
@@ -56,31 +65,25 @@ pub trait PridevaultCasino {
     fn upgrade(&self) {}
 
     #[only_owner]
-    #[payable("EGLD")]
+    #[payable]
     #[endpoint(fundBankroll)]
     fn fund_bankroll(&self) {
-        let amount = self.call_value().egld().clone();
-        require!(amount > 0, "zero");
-        self.bankroll_funded_event(&amount);
+        let payment = self.call_value().egld_or_single_esdt();
+        require!(payment.amount > 0, "zero");
+        if !payment.token_identifier.is_egld() {
+            require!(
+                payment.token_identifier == self.roar_id_or(),
+                "token not accepted"
+            );
+        }
+        self.bankroll_funded_event(&payment.amount);
     }
 
     #[only_owner]
-    #[endpoint(setParams)]
-    fn set_params(
-        &self,
-        min_bet: BigUint,
-        cap_max_bet: BigUint,
-        round_blocks: u64,
-        min_bankroll: BigUint,
-    ) {
-        require!(self.round_open().is_empty() || !self.round_open().get(), "round open");
-        require!(min_bet > 0 && cap_max_bet >= min_bet, "bad bets");
-        require!(round_blocks >= 2, "round too short");
-        require!(min_bankroll > 0, "min bankroll");
-        self.min_bet().set(min_bet);
-        self.cap_max_bet().set(cap_max_bet);
-        self.round_blocks().set(round_blocks);
-        self.min_bankroll().set(min_bankroll);
+    #[endpoint(setRoarToken)]
+    fn set_roar_token(&self, roar_token: TokenIdentifier) {
+        require!(roar_token.is_valid_esdt_identifier(), "bad ROAR token");
+        self.roar_token().set(roar_token);
     }
 
     #[only_owner]
@@ -99,8 +102,6 @@ pub trait PridevaultCasino {
     #[only_owner]
     #[endpoint(unpause)]
     fn unpause(&self) {
-        let free = self.free_bankroll();
-        require!(free >= self.min_bankroll().get(), "bankroll too thin");
         self.is_paused().set(false);
     }
 
@@ -108,25 +109,23 @@ pub trait PridevaultCasino {
     #[endpoint(startRound)]
     fn start_round(&self) {
         self.require_not_paused();
-        require!(
-            self.round_open().is_empty() || !self.round_open().get(),
-            "already open"
-        );
+        require!(self.round_open().is_empty() || !self.round_open().get(), "already open");
         require!(!self.has_unsettled_bets(), "finish previous resolve");
-        require!(self.free_bankroll() >= self.min_bankroll().get(), "bankroll too thin");
 
         let next_id = self.round_id().get() + 1;
         self.round_id().set(next_id);
         self.round_open().set(true);
         let end = self.blockchain().get_block_nonce() + self.round_blocks().get();
         self.round_end_block().set(end);
-        self.round_liability().set(BigUint::zero());
+        self.round_liability_egld().set(BigUint::zero());
+        self.round_liability_roar().set(BigUint::zero());
         self.round_seed().clear();
         self.bets().clear();
         self.round_started_event(next_id, end);
     }
 
-    #[payable("EGLD")]
+    /// Pay EGLD or ROAR. Rake: EGLD 4%, ROAR 2%.
+    #[payable]
     #[endpoint(placeBet)]
     fn place_bet(&self, under: u64) {
         self.require_not_paused();
@@ -137,26 +136,37 @@ pub trait PridevaultCasino {
         );
         require!(under >= MIN_UNDER && under <= MAX_UNDER, "under 2..96");
 
-        let amount = self.call_value().egld().clone();
-        require!(amount >= self.min_bet().get(), "below min");
+        let payment = self.call_value().egld_or_single_esdt();
+        let is_roar = !payment.token_identifier.is_egld();
+        if is_roar {
+            require!(payment.token_identifier == self.roar_id_or(), "token not accepted");
+            require!(payment.token_nonce == 0, "ROAR must be fungible");
+        }
 
-        let dyn_max = self.dynamic_max_bet();
-        require!(amount <= dyn_max, "above dynamic max");
-        require!(amount <= self.cap_max_bet().get(), "above cap");
+        let amount = payment.amount;
+        let min = if is_roar { self.min_bet_roar().get() } else { self.min_bet_egld().get() };
+        let cap = if is_roar { self.cap_max_roar().get() } else { self.cap_max_egld().get() };
+        require!(amount >= min, "below min");
+        require!(amount <= cap, "above cap");
+        require!(amount <= self.dynamic_max_bet(is_roar), "above dynamic max");
 
-        let rake = &amount * RAKE_BPS / BPS_DENOM;
+        let rake_bps = if is_roar { RAKE_ROAR_BPS } else { RAKE_EGLD_BPS };
+        let rake = &amount * rake_bps / BPS_DENOM;
         let net = &amount - &rake;
         let payout = self.potential_payout(&net, under);
-        let new_liability = self.round_liability().get() + &payout;
 
-        self.round_liability().set(&new_liability);
-        require!(
-            self.free_bankroll() >= self.min_bankroll().get(),
-            "insufficient bankroll"
-        );
-
-        if rake > 0 {
-            self.rake_accrued().update(|r| *r += rake);
+        if is_roar {
+            self.round_liability_roar().update(|l| *l += &payout);
+            require!(self.free_bankroll_roar() >= self.min_bankroll_roar().get(), "ROAR bankroll thin");
+            if rake > 0 {
+                self.rake_accrued_roar().update(|r| *r += rake);
+            }
+        } else {
+            self.round_liability_egld().update(|l| *l += &payout);
+            require!(self.free_bankroll_egld() >= self.min_bankroll_egld().get(), "EGLD bankroll thin");
+            if rake > 0 {
+                self.rake_accrued_egld().update(|r| *r += rake);
+            }
         }
 
         let player = self.blockchain().get_caller();
@@ -164,11 +174,11 @@ pub trait PridevaultCasino {
             player: player.clone(),
             amount: net,
             under,
+            is_roar,
             settled: false,
             won: false,
             roll: 0,
         });
-
         self.bet_placed_event(self.round_id().get(), &player, &amount, under);
     }
 
@@ -202,26 +212,31 @@ pub trait PridevaultCasino {
             if bet.settled {
                 continue;
             }
-
             let roll = self.roll_for(seed, i as u64);
-            let won = roll < bet.under;
             bet.roll = roll;
-            bet.won = won;
+            bet.won = roll < bet.under;
             bet.settled = true;
             self.bets().set(i, &bet);
-
-            if won {
+            if bet.won {
                 let payout = self.potential_payout(&bet.amount, bet.under);
-                self.claimable(&bet.player).update(|c| *c += &payout);
-                self.total_claimable().update(|t| *t += payout);
+                if bet.is_roar {
+                    self.claimable_roar(&bet.player).update(|c| *c += &payout);
+                    self.total_claimable_roar().update(|t| *t += payout);
+                } else {
+                    self.claimable_egld(&bet.player).update(|c| *c += &payout);
+                    self.total_claimable_egld().update(|t| *t += payout);
+                }
             }
             processed += 1;
         }
 
         if self.all_bets_settled() {
-            self.round_liability().clear();
+            self.round_liability_egld().clear();
+            self.round_liability_roar().clear();
             self.round_seed().clear();
-            if self.free_bankroll() < self.min_bankroll().get() {
+            if self.free_bankroll_egld() < self.min_bankroll_egld().get()
+                && self.free_bankroll_roar() < self.min_bankroll_roar().get()
+            {
                 self.is_paused().set(true);
             }
         }
@@ -230,25 +245,54 @@ pub trait PridevaultCasino {
     #[endpoint(claim)]
     fn claim(&self) {
         let caller = self.blockchain().get_caller();
-        let amount = self.claimable(&caller).take();
-        require!(amount > 0, "nothing to claim");
-        self.total_claimable().update(|t| *t -= &amount);
-        self.tx().to(&caller).egld(&amount).transfer();
-        self.claim_event(&caller, &amount);
+        let egld_amt = self.claimable_egld(&caller).take();
+        let roar_amt = self.claimable_roar(&caller).take();
+        require!(egld_amt > 0 || roar_amt > 0, "nothing to claim");
+        if egld_amt > 0 {
+            self.total_claimable_egld().update(|t| *t -= &egld_amt);
+            self.tx().to(&caller).egld(&egld_amt).transfer();
+        }
+        if roar_amt > 0 {
+            self.total_claimable_roar().update(|t| *t -= &roar_amt);
+            let token = self.roar_token().get();
+            self.tx()
+                .to(&caller)
+                .single_esdt(&token, 0, &roar_amt)
+                .transfer();
+        }
+        self.claim_event(&caller, &egld_amt);
     }
 
-    /// Skim only rake + surplus above 2× min_bankroll. Bankroll stays self-funded.
     #[endpoint(skimToTreasury)]
     fn skim_to_treasury(&self) {
         require!(self.round_open().is_empty() || !self.round_open().get(), "round open");
         require!(self.round_seed().is_empty(), "resolve in progress");
+        let treasury = self.treasury().get();
+        self.skim_one(false, &treasury);
+        self.skim_one(true, &treasury);
+    }
 
-        let buffer = self.min_bankroll().get() * SKIM_BUFFER_MULT;
-        let free = self.free_bankroll();
-        require!(free > buffer, "buffer not filled");
-
-        let mut send_amount = self.rake_accrued().get();
+    fn skim_one(&self, is_roar: bool, treasury: &ManagedAddress) {
+        let buffer = if is_roar {
+            self.min_bankroll_roar().get() * SKIM_BUFFER_MULT
+        } else {
+            self.min_bankroll_egld().get() * SKIM_BUFFER_MULT
+        };
+        let free = if is_roar {
+            self.free_bankroll_roar()
+        } else {
+            self.free_bankroll_egld()
+        };
+        if free <= buffer {
+            return;
+        }
+        let accrued = if is_roar {
+            self.rake_accrued_roar().get()
+        } else {
+            self.rake_accrued_egld().get()
+        };
         let extra = &free - &buffer;
+        let mut send_amount = accrued.clone();
         if extra > send_amount {
             send_amount = extra / 2u32 + send_amount;
             if send_amount > extra {
@@ -257,19 +301,30 @@ pub trait PridevaultCasino {
         } else if send_amount > extra {
             send_amount = extra;
         }
-
-        require!(send_amount > 0, "nothing to skim");
-
-        let accrued = self.rake_accrued().get();
-        if accrued <= send_amount {
-            self.rake_accrued().clear();
-        } else {
-            self.rake_accrued().set(accrued - &send_amount);
+        if send_amount == 0 {
+            return;
         }
-
-        let treasury = self.treasury().get();
-        self.tx().to(&treasury).egld(&send_amount).transfer();
-        self.skim_event(&treasury, &send_amount);
+        if accrued <= send_amount {
+            if is_roar {
+                self.rake_accrued_roar().clear();
+            } else {
+                self.rake_accrued_egld().clear();
+            }
+        } else if is_roar {
+            self.rake_accrued_roar().set(accrued - &send_amount);
+        } else {
+            self.rake_accrued_egld().set(accrued - &send_amount);
+        }
+        if is_roar {
+            let token = self.roar_token().get();
+            self.tx()
+                .to(treasury)
+                .single_esdt(&token, 0, &send_amount)
+                .transfer();
+        } else {
+            self.tx().to(treasury).egld(&send_amount).transfer();
+        }
+        self.skim_event(treasury, &send_amount);
     }
 
     fn potential_payout(&self, amount: &BigUint, under: u64) -> BigUint {
@@ -280,33 +335,61 @@ pub trait PridevaultCasino {
         seed.wrapping_mul(1_000_003).wrapping_add(index) % ROLL_MOD
     }
 
-    fn sc_egld_balance(&self) -> BigUint {
-        self.blockchain()
-            .get_sc_balance(&EgldOrEsdtTokenIdentifier::egld(), 0)
+    fn roar_id_or(&self) -> EgldOrEsdtTokenIdentifier {
+        EgldOrEsdtTokenIdentifier::esdt(self.roar_token().get())
     }
 
-    fn reserved(&self) -> BigUint {
-        let mut r = self.total_claimable().get() + self.round_liability().get();
-        r += self.rake_accrued().get();
-        r
-    }
-
-    #[view(getFreeBankroll)]
-    fn free_bankroll(&self) -> BigUint {
-        let bal = self.sc_egld_balance();
-        let res = self.reserved();
-        if bal > res {
-            bal - res
+    fn token_balance(&self, is_roar: bool) -> BigUint {
+        if is_roar {
+            self.blockchain()
+                .get_sc_balance(&self.roar_id_or(), 0)
         } else {
-            BigUint::zero()
+            self.blockchain()
+                .get_sc_balance(&EgldOrEsdtTokenIdentifier::egld(), 0)
         }
     }
 
-    #[view(getDynamicMaxBet)]
-    fn dynamic_max_bet(&self) -> BigUint {
-        let from_bank = self.free_bankroll() * MAX_BET_FREE_BPS / BPS_DENOM;
-        let cap = self.cap_max_bet().get();
-        let min = self.min_bet().get();
+    fn reserved(&self, is_roar: bool) -> BigUint {
+        if is_roar {
+            self.total_claimable_roar().get()
+                + self.round_liability_roar().get()
+                + self.rake_accrued_roar().get()
+        } else {
+            self.total_claimable_egld().get()
+                + self.round_liability_egld().get()
+                + self.rake_accrued_egld().get()
+        }
+    }
+
+    #[view(getFreeBankrollEgld)]
+    fn free_bankroll_egld(&self) -> BigUint {
+        let bal = self.token_balance(false);
+        let res = self.reserved(false);
+        if bal > res { bal - res } else { BigUint::zero() }
+    }
+
+    #[view(getFreeBankrollRoar)]
+    fn free_bankroll_roar(&self) -> BigUint {
+        let bal = self.token_balance(true);
+        let res = self.reserved(true);
+        if bal > res { bal - res } else { BigUint::zero() }
+    }
+
+    #[view(getDynamicMaxBetEgld)]
+    fn dynamic_max_bet_egld(&self) -> BigUint {
+        self.dynamic_max_bet(false)
+    }
+
+    #[view(getDynamicMaxBetRoar)]
+    fn dynamic_max_bet_roar(&self) -> BigUint {
+        self.dynamic_max_bet(true)
+    }
+
+    fn dynamic_max_bet(&self, is_roar: bool) -> BigUint {
+        let free = if is_roar { self.free_bankroll_roar() } else { self.free_bankroll_egld() };
+        let from_bank = free * MAX_BET_FREE_BPS / BPS_DENOM;
+        let cap = if is_roar { self.cap_max_roar().get() } else { self.cap_max_egld().get() };
+        let min = if is_roar { self.min_bet_roar().get() } else { self.min_bet_egld().get() };
         if from_bank < min {
             min
         } else if from_bank < cap {
@@ -338,21 +421,37 @@ pub trait PridevaultCasino {
     #[storage_mapper("treasury")]
     fn treasury(&self) -> SingleValueMapper<ManagedAddress>;
 
-    #[view(getMinBet)]
-    #[storage_mapper("minBet")]
-    fn min_bet(&self) -> SingleValueMapper<BigUint>;
+    #[view(getRoarToken)]
+    #[storage_mapper("roarToken")]
+    fn roar_token(&self) -> SingleValueMapper<TokenIdentifier>;
 
-    #[view(getCapMaxBet)]
-    #[storage_mapper("capMaxBet")]
-    fn cap_max_bet(&self) -> SingleValueMapper<BigUint>;
+    #[view(getMinBetEgld)]
+    #[storage_mapper("minBetEgld")]
+    fn min_bet_egld(&self) -> SingleValueMapper<BigUint>;
+
+    #[view(getCapMaxEgld)]
+    #[storage_mapper("capMaxEgld")]
+    fn cap_max_egld(&self) -> SingleValueMapper<BigUint>;
+
+    #[view(getMinBetRoar)]
+    #[storage_mapper("minBetRoar")]
+    fn min_bet_roar(&self) -> SingleValueMapper<BigUint>;
+
+    #[view(getCapMaxRoar)]
+    #[storage_mapper("capMaxRoar")]
+    fn cap_max_roar(&self) -> SingleValueMapper<BigUint>;
 
     #[view(getRoundBlocks)]
     #[storage_mapper("roundBlocks")]
     fn round_blocks(&self) -> SingleValueMapper<u64>;
 
-    #[view(getMinBankroll)]
-    #[storage_mapper("minBankroll")]
-    fn min_bankroll(&self) -> SingleValueMapper<BigUint>;
+    #[view(getMinBankrollEgld)]
+    #[storage_mapper("minBankrollEgld")]
+    fn min_bankroll_egld(&self) -> SingleValueMapper<BigUint>;
+
+    #[view(getMinBankrollRoar)]
+    #[storage_mapper("minBankrollRoar")]
+    fn min_bankroll_roar(&self) -> SingleValueMapper<BigUint>;
 
     #[view(isPaused)]
     #[storage_mapper("isPaused")]
@@ -374,28 +473,45 @@ pub trait PridevaultCasino {
     #[storage_mapper("roundSeed")]
     fn round_seed(&self) -> SingleValueMapper<u64>;
 
-    #[view(getRoundLiability)]
-    #[storage_mapper("roundLiability")]
-    fn round_liability(&self) -> SingleValueMapper<BigUint>;
+    #[storage_mapper("roundLiabilityEgld")]
+    fn round_liability_egld(&self) -> SingleValueMapper<BigUint>;
 
-    #[view(getRakeAccrued)]
-    #[storage_mapper("rakeAccrued")]
-    fn rake_accrued(&self) -> SingleValueMapper<BigUint>;
+    #[storage_mapper("roundLiabilityRoar")]
+    fn round_liability_roar(&self) -> SingleValueMapper<BigUint>;
+
+    #[view(getRakeAccruedEgld)]
+    #[storage_mapper("rakeAccruedEgld")]
+    fn rake_accrued_egld(&self) -> SingleValueMapper<BigUint>;
+
+    #[view(getRakeAccruedRoar)]
+    #[storage_mapper("rakeAccruedRoar")]
+    fn rake_accrued_roar(&self) -> SingleValueMapper<BigUint>;
 
     #[storage_mapper("bets")]
     fn bets(&self) -> VecMapper<Bet<Self::Api>>;
 
-    #[view(getClaimable)]
-    #[storage_mapper("claimable")]
-    fn claimable(&self, user: &ManagedAddress) -> SingleValueMapper<BigUint>;
+    #[view(getClaimableEgld)]
+    #[storage_mapper("claimableEgld")]
+    fn claimable_egld(&self, user: &ManagedAddress) -> SingleValueMapper<BigUint>;
 
-    #[view(getTotalClaimable)]
-    #[storage_mapper("totalClaimable")]
-    fn total_claimable(&self) -> SingleValueMapper<BigUint>;
+    #[view(getClaimableRoar)]
+    #[storage_mapper("claimableRoar")]
+    fn claimable_roar(&self, user: &ManagedAddress) -> SingleValueMapper<BigUint>;
+
+    #[storage_mapper("totalClaimableEgld")]
+    fn total_claimable_egld(&self) -> SingleValueMapper<BigUint>;
+
+    #[storage_mapper("totalClaimableRoar")]
+    fn total_claimable_roar(&self) -> SingleValueMapper<BigUint>;
 
     #[view(getBetCount)]
     fn get_bet_count(&self) -> usize {
         self.bets().len()
+    }
+
+    #[view(getRakeBps)]
+    fn get_rake_bps(&self) -> MultiValue2<u64, u64> {
+        (RAKE_EGLD_BPS, RAKE_ROAR_BPS).into()
     }
 
     #[event("roundStarted")]
