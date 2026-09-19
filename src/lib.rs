@@ -2,13 +2,19 @@
 
 use multiversx_sc::imports::*;
 
-/// House edge 4.00%.
-const HOUSE_EDGE_BPS: u64 = 400;
+/// Payout house edge 5.00%.
+const HOUSE_EDGE_BPS: u64 = 500;
+/// Instant rake 2.00% of each bet. Accrued in-contract; only skimmed when buffer is healthy.
+const RAKE_BPS: u64 = 200;
 const BPS_DENOM: u64 = 10_000;
 const MIN_UNDER: u64 = 2;
 const MAX_UNDER: u64 = 96;
 const ROLL_MOD: u64 = 100;
 const MAX_BETS_PER_RESOLVE: usize = 50;
+/// Max single bet = 2% of free bankroll.
+const MAX_BET_FREE_BPS: u64 = 200;
+/// Keep at least 2× min_bankroll before any treasury skim.
+const SKIM_BUFFER_MULT: u32 = 2;
 
 #[derive(TopEncode, TopDecode, NestedEncode, NestedDecode, TypeAbi, Clone)]
 pub struct Bet<M: ManagedTypeApi> {
@@ -27,18 +33,19 @@ pub trait PridevaultCasino {
         &self,
         treasury: ManagedAddress,
         min_bet: BigUint,
-        max_bet: BigUint,
+        cap_max_bet: BigUint,
         round_blocks: u64,
         min_bankroll: BigUint,
     ) {
         require!(!treasury.is_zero(), "treasury required");
         require!(min_bet > 0, "min bet");
-        require!(max_bet >= min_bet, "max < min");
+        require!(cap_max_bet >= min_bet, "max < min");
         require!(round_blocks >= 2, "round too short");
+        require!(min_bankroll > 0, "min bankroll");
 
         self.treasury().set(treasury);
         self.min_bet().set(min_bet);
-        self.max_bet().set(max_bet);
+        self.cap_max_bet().set(cap_max_bet);
         self.round_blocks().set(round_blocks);
         self.min_bankroll().set(min_bankroll);
         self.is_paused().set(false);
@@ -62,15 +69,16 @@ pub trait PridevaultCasino {
     fn set_params(
         &self,
         min_bet: BigUint,
-        max_bet: BigUint,
+        cap_max_bet: BigUint,
         round_blocks: u64,
         min_bankroll: BigUint,
     ) {
         require!(self.round_open().is_empty() || !self.round_open().get(), "round open");
-        require!(min_bet > 0 && max_bet >= min_bet, "bad bets");
+        require!(min_bet > 0 && cap_max_bet >= min_bet, "bad bets");
         require!(round_blocks >= 2, "round too short");
+        require!(min_bankroll > 0, "min bankroll");
         self.min_bet().set(min_bet);
-        self.max_bet().set(max_bet);
+        self.cap_max_bet().set(cap_max_bet);
         self.round_blocks().set(round_blocks);
         self.min_bankroll().set(min_bankroll);
     }
@@ -91,6 +99,8 @@ pub trait PridevaultCasino {
     #[only_owner]
     #[endpoint(unpause)]
     fn unpause(&self) {
+        let free = self.free_bankroll();
+        require!(free >= self.min_bankroll().get(), "bankroll too thin");
         self.is_paused().set(false);
     }
 
@@ -103,6 +113,7 @@ pub trait PridevaultCasino {
             "already open"
         );
         require!(!self.has_unsettled_bets(), "finish previous resolve");
+        require!(self.free_bankroll() >= self.min_bankroll().get(), "bankroll too thin");
 
         let next_id = self.round_id().get() + 1;
         self.round_id().set(next_id);
@@ -115,7 +126,6 @@ pub trait PridevaultCasino {
         self.round_started_event(next_id, end);
     }
 
-    /// Place a dice bet: win if future roll in [0, 99] is strictly < `under`.
     #[payable("EGLD")]
     #[endpoint(placeBet)]
     fn place_bet(&self, under: u64) {
@@ -129,24 +139,30 @@ pub trait PridevaultCasino {
 
         let amount = self.call_value().egld().clone();
         require!(amount >= self.min_bet().get(), "below min");
-        require!(amount <= self.max_bet().get(), "above max");
 
-        let payout = self.potential_payout(&amount, under);
+        let dyn_max = self.dynamic_max_bet();
+        require!(amount <= dyn_max, "above dynamic max");
+        require!(amount <= self.cap_max_bet().get(), "above cap");
+
+        let rake = &amount * RAKE_BPS / BPS_DENOM;
+        let net = &amount - &rake;
+        let payout = self.potential_payout(&net, under);
         let new_liability = self.round_liability().get() + &payout;
-        let balance = self
-            .blockchain()
-            .get_sc_balance(&EgldOrEsdtTokenIdentifier::egld(), 0);
+
+        self.round_liability().set(&new_liability);
         require!(
-            balance >= &new_liability + &self.min_bankroll().get() + &self.total_claimable().get(),
+            self.free_bankroll() >= self.min_bankroll().get(),
             "insufficient bankroll"
         );
 
-        self.round_liability().set(&new_liability);
+        if rake > 0 {
+            self.rake_accrued().update(|r| *r += rake);
+        }
 
         let player = self.blockchain().get_caller();
         self.bets().push(&Bet {
             player: player.clone(),
-            amount: amount.clone(),
+            amount: net,
             under,
             settled: false,
             won: false,
@@ -156,8 +172,6 @@ pub trait PridevaultCasino {
         self.bet_placed_event(self.round_id().get(), &player, &amount, under);
     }
 
-    /// Close betting and settle. Callable by anyone after deadline.
-    /// Call again if there are more than 50 bets (gas).
     #[endpoint(resolveRound)]
     fn resolve_round(&self) {
         let open = !self.round_open().is_empty() && self.round_open().get();
@@ -207,6 +221,9 @@ pub trait PridevaultCasino {
         if self.all_bets_settled() {
             self.round_liability().clear();
             self.round_seed().clear();
+            if self.free_bankroll() < self.min_bankroll().get() {
+                self.is_paused().set(true);
+            }
         }
     }
 
@@ -220,22 +237,39 @@ pub trait PridevaultCasino {
         self.claim_event(&caller, &amount);
     }
 
-    /// Send surplus above min_bankroll + pending claims to PrideVault treasury.
-    #[only_owner]
+    /// Skim only rake + surplus above 2× min_bankroll. Bankroll stays self-funded.
     #[endpoint(skimToTreasury)]
     fn skim_to_treasury(&self) {
         require!(self.round_open().is_empty() || !self.round_open().get(), "round open");
         require!(self.round_seed().is_empty(), "resolve in progress");
 
-        let balance = self
-            .blockchain()
-            .get_sc_balance(&EgldOrEsdtTokenIdentifier::egld(), 0);
-        let reserved = self.min_bankroll().get() + self.total_claimable().get();
-        require!(balance > reserved, "nothing to skim");
-        let surplus = balance - reserved;
+        let buffer = self.min_bankroll().get() * SKIM_BUFFER_MULT;
+        let free = self.free_bankroll();
+        require!(free > buffer, "buffer not filled");
+
+        let mut send_amount = self.rake_accrued().get();
+        let extra = &free - &buffer;
+        if extra > send_amount {
+            send_amount = extra / 2u32 + send_amount;
+            if send_amount > extra {
+                send_amount = extra;
+            }
+        } else if send_amount > extra {
+            send_amount = extra;
+        }
+
+        require!(send_amount > 0, "nothing to skim");
+
+        let accrued = self.rake_accrued().get();
+        if accrued <= send_amount {
+            self.rake_accrued().clear();
+        } else {
+            self.rake_accrued().set(accrued - &send_amount);
+        }
+
         let treasury = self.treasury().get();
-        self.tx().to(&treasury).egld(&surplus).transfer();
-        self.skim_event(&treasury, &surplus);
+        self.tx().to(&treasury).egld(&send_amount).transfer();
+        self.skim_event(&treasury, &send_amount);
     }
 
     fn potential_payout(&self, amount: &BigUint, under: u64) -> BigUint {
@@ -244,6 +278,42 @@ pub trait PridevaultCasino {
 
     fn roll_for(&self, seed: u64, index: u64) -> u64 {
         seed.wrapping_mul(1_000_003).wrapping_add(index) % ROLL_MOD
+    }
+
+    fn sc_egld_balance(&self) -> BigUint {
+        self.blockchain()
+            .get_sc_balance(&EgldOrEsdtTokenIdentifier::egld(), 0)
+    }
+
+    fn reserved(&self) -> BigUint {
+        let mut r = self.total_claimable().get() + self.round_liability().get();
+        r += self.rake_accrued().get();
+        r
+    }
+
+    #[view(getFreeBankroll)]
+    fn free_bankroll(&self) -> BigUint {
+        let bal = self.sc_egld_balance();
+        let res = self.reserved();
+        if bal > res {
+            bal - res
+        } else {
+            BigUint::zero()
+        }
+    }
+
+    #[view(getDynamicMaxBet)]
+    fn dynamic_max_bet(&self) -> BigUint {
+        let from_bank = self.free_bankroll() * MAX_BET_FREE_BPS / BPS_DENOM;
+        let cap = self.cap_max_bet().get();
+        let min = self.min_bet().get();
+        if from_bank < min {
+            min
+        } else if from_bank < cap {
+            from_bank
+        } else {
+            cap
+        }
     }
 
     fn all_bets_settled(&self) -> bool {
@@ -272,9 +342,9 @@ pub trait PridevaultCasino {
     #[storage_mapper("minBet")]
     fn min_bet(&self) -> SingleValueMapper<BigUint>;
 
-    #[view(getMaxBet)]
-    #[storage_mapper("maxBet")]
-    fn max_bet(&self) -> SingleValueMapper<BigUint>;
+    #[view(getCapMaxBet)]
+    #[storage_mapper("capMaxBet")]
+    fn cap_max_bet(&self) -> SingleValueMapper<BigUint>;
 
     #[view(getRoundBlocks)]
     #[storage_mapper("roundBlocks")]
@@ -307,6 +377,10 @@ pub trait PridevaultCasino {
     #[view(getRoundLiability)]
     #[storage_mapper("roundLiability")]
     fn round_liability(&self) -> SingleValueMapper<BigUint>;
+
+    #[view(getRakeAccrued)]
+    #[storage_mapper("rakeAccrued")]
+    fn rake_accrued(&self) -> SingleValueMapper<BigUint>;
 
     #[storage_mapper("bets")]
     fn bets(&self) -> VecMapper<Bet<Self::Api>>;
