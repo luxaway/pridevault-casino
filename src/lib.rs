@@ -1,6 +1,7 @@
 #![no_std]
 
 use multiversx_sc::imports::*;
+use multiversx_sc::derive_imports::*;
 
 const HOUSE_EDGE_BPS: u64 = 500;
 /// ROAR keeps the current 2% rake.
@@ -15,7 +16,8 @@ const MAX_BETS_PER_RESOLVE: usize = 50;
 const MAX_BET_FREE_BPS: u64 = 200;
 const SKIM_BUFFER_MULT: u32 = 2;
 
-#[derive(TopEncode, TopDecode, NestedEncode, NestedDecode, TypeAbi, Clone)]
+#[type_abi]
+#[derive(TopEncode, TopDecode, NestedEncode, NestedDecode, Clone)]
 pub struct Bet<M: ManagedTypeApi> {
     pub player: ManagedAddress<M>,
     pub amount: BigUint<M>,
@@ -83,6 +85,10 @@ pub trait PridevaultCasino {
     #[endpoint(setRoarToken)]
     fn set_roar_token(&self, roar_token: TokenIdentifier) {
         require!(roar_token.is_valid_esdt_identifier(), "bad ROAR token");
+        require!(
+            self.total_claimable_roar().get() == 0,
+            "ROAR claims pending"
+        );
         self.roar_token().set(roar_token);
     }
 
@@ -105,12 +111,16 @@ pub trait PridevaultCasino {
         self.is_paused().set(false);
     }
 
-    #[only_owner]
     #[endpoint(startRound)]
     fn start_round(&self) {
         self.require_not_paused();
         require!(self.round_open().is_empty() || !self.round_open().get(), "already open");
         require!(!self.has_unsettled_bets(), "finish previous resolve");
+        require!(
+            self.free_bankroll_egld() >= self.min_bankroll_egld().get()
+                || self.free_bankroll_roar() >= self.min_bankroll_roar().get(),
+            "bankroll thin"
+        );
 
         let next_id = self.round_id().get() + 1;
         self.round_id().set(next_id);
@@ -135,6 +145,7 @@ pub trait PridevaultCasino {
             "betting closed"
         );
         require!(under >= MIN_UNDER && under <= MAX_UNDER, "under 2..96");
+        require!(self.bets().len() < MAX_BETS_PER_RESOLVE, "round full");
 
         let payment = self.call_value().egld_or_single_esdt();
         let is_roar = !payment.token_identifier.is_egld();
@@ -179,7 +190,7 @@ pub trait PridevaultCasino {
             won: false,
             roll: 0,
         });
-        self.bet_placed_event(self.round_id().get(), &player, &amount, under);
+        self.bet_placed_event(self.round_id().get(), &player, under, &amount);
     }
 
     #[endpoint(resolveRound)]
@@ -188,13 +199,13 @@ pub trait PridevaultCasino {
         let resolving = !self.round_seed().is_empty();
         require!(open || resolving, "nothing to resolve");
         require!(
-            self.blockchain().get_block_nonce() >= self.round_end_block().get(),
+            self.blockchain().get_block_nonce() > self.round_end_block().get(),
             "too early"
         );
 
         if self.round_seed().is_empty() {
             let mut rng = RandomnessSource::new();
-            let seed = rng.next_u64();
+            let seed = rng.next_u64() ^ self.round_id().get();
             self.round_seed().set(seed);
             self.round_open().set(false);
             self.round_resolved_event(self.round_id().get(), seed);
@@ -294,7 +305,7 @@ pub trait PridevaultCasino {
         let extra = &free - &buffer;
         let mut send_amount = accrued.clone();
         if extra > send_amount {
-            send_amount = extra / 2u32 + send_amount;
+            send_amount = extra.clone() / 2u32 + send_amount;
             if send_amount > extra {
                 send_amount = extra;
             }
@@ -522,8 +533,8 @@ pub trait PridevaultCasino {
         &self,
         #[indexed] round_id: u64,
         #[indexed] player: &ManagedAddress,
+        #[indexed] under: u64,
         amount: &BigUint,
-        under: u64,
     );
 
     #[event("roundResolved")]
