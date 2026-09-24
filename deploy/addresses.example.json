@@ -1,10 +1,10 @@
 {
   "network": "devnet",
   "contract": "",
-  "owner": "",
+  "owner": "erd1qawhhjl5cw4f5hffysdwk6rax9j6m5xld303xy4n46q9sm59pv5qe2mrj8",
   "treasury": "erd1yqu7lartn9wgp65kauq98d0mpfnncaes3q3he4wwr8esp5e3ljkqd5a03k",
   "treasuryHerotag": "luxaway.elrond",
   "roarToken": "",
   "deployTx": "",
-  "prideVaultField": "src/lib/sections.ts → GAMES.treasury"
+  "prideVaultField": "src/lib/sections.ts → GAMES.treasury / GAMES.roarDice"
 }
