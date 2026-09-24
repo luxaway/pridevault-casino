@@ -2,8 +2,9 @@
   "network": "devnet",
   "contract": "",
   "owner": "",
-  "treasury": "",
+  "treasury": "erd1yqu7lartn9wgp65kauq98d0mpfnncaes3q3he4wwr8esp5e3ljkqd5a03k",
+  "treasuryHerotag": "luxaway.elrond",
   "roarToken": "",
   "deployTx": "",
-  "prideVaultField": "src/lib/sections.ts → GAMES.roarDice"
+  "prideVaultField": "src/lib/sections.ts → GAMES.treasury"
 }
